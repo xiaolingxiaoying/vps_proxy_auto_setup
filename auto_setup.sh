@@ -5,6 +5,14 @@ set -euo pipefail
 # VPS 流量统计与订阅管理 自动配置脚本
 # 用法:
 #   bash <(curl -fsSL https://raw.githubusercontent.com/<user>/<repo>/main/auto_setup.sh)
+#
+# 功能:
+#   - 通过 vnstat + sysfs 实时监控 VPS 出口流量
+#   - Python HTTP 服务下发带 subscription-userinfo 的订阅 YAML
+#   - Caddy 反向代理提供 HTTPS + Basic Auth 鉴权
+#   - 支持 ?token= 参数免密访问 (给 CMFA 等不支持 BasicAuth 的客户端)
+#   - 每月自动重置流量基线
+#   - 每 5 分钟同步上游订阅配置
 # ==============================================================================
 
 # 0. 确保交互式输入可用 (兼容 bash <(curl ...) 方式)
@@ -43,29 +51,35 @@ if [ -z "$CADDY_USER" ]; then
     exit 1
 fi
 
+# URL 编码函数 (安全传递任意字符到 python3，使用 stdin 避免引号/特殊字符问题)
+urlencode() {
+    printf '%s' "$1" | python3 -c "import sys, urllib.parse; print(urllib.parse.quote(sys.stdin.buffer.read().decode(), safe=''), end='')"
+}
+
 while true; do
-    read -rs -p "请输入访问密码 (用于 BasicAuth，避免使用 @:/ 等特殊字符): " CADDY_PASS
+    read -rs -p "请输入访问密码 (用于 BasicAuth，支持特殊字符): " CADDY_PASS
     echo
     if [ -z "$CADDY_PASS" ]; then
         echo "错误: 密码不能为空，请重新输入"
         continue
     fi
-    # 检查密码中是否含 URL 不安全字符
+    # 检查密码中是否含 URL 不安全字符，提示但不阻止
     if [[ "$CADDY_PASS" =~ [@:/] ]]; then
-        echo "警告: 密码中包含 @ : / 字符，这会导致一键导入链接无法正常使用。"
-        read -rp "是否仍使用此密码? (y/N): " confirm
-        if [[ "$confirm" =~ ^[Yy]$ ]]; then
-            break
-        fi
-    else
-        break
+        echo "提示: 密码中包含特殊字符，一键导入链接将自动进行 URL 编码处理。"
     fi
+    break
 done
 
 read -rp "请输入每月流量上限 (GiB，默认 200): " TRAFFIC_LIMIT_GIB
 TRAFFIC_LIMIT_GIB=${TRAFFIC_LIMIT_GIB:-200}
 read -rp "请输入计费时区 (默认 America/Los_Angeles): " TZ_NAME
 TZ_NAME=${TZ_NAME:-America/Los_Angeles}
+
+# 验证时区合法性
+if [ ! -f "/usr/share/zoneinfo/$TZ_NAME" ]; then
+    echo "错误: 无效的时区 '$TZ_NAME'，请使用类似 America/Los_Angeles 的格式"
+    exit 1
+fi
 
 # 自动获取默认网卡
 DEFAULT_IFACE=$(ip route get 1.1.1.1 | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')
@@ -88,13 +102,17 @@ echo "=================================================="
 
 echo "[1/8] 安装基础依赖 (vnstat, python3, curl, openssl)..."
 apt-get update -qq
-apt-get install -y -qq vnstat python3 curl jq openssl debian-keyring debian-archive-keyring apt-transport-https
+apt-get install -y -qq vnstat python3 curl jq openssl debian-keyring debian-archive-keyring apt-transport-https gpg
 
 echo "[2/8] 安装 Caddy (通过官方 APT 仓库)..."
 # 使用 Caddy 官方 APT 仓库，确保稳定可靠
 if ! command -v caddy &>/dev/null; then
-    curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
-    curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' | tee /etc/apt/sources.list.d/caddy-stable.list
+    # 幂等处理：先删除旧 key 再导入，避免重复运行报错
+    rm -f /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+    curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' \
+        | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+    curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' \
+        | tee /etc/apt/sources.list.d/caddy-stable.list > /dev/null
     apt-get update -qq
     apt-get install -y -qq caddy
 else
@@ -399,10 +417,12 @@ UNIT
 systemctl daemon-reload
 systemctl enable --now refresh-sub-copy.timer
 systemctl enable --now reset-tx-baseline.timer
-systemctl enable --now sub-server
+# 使用 restart 而非 start，确保覆盖部署时环境变量生效
+systemctl enable sub-server
+systemctl restart sub-server
 
 echo "[8/8] 配置 Caddy (反向代理与鉴权)..."
-# 清理 caddy hash-password 输出中可能的多余空白
+# 生成密码哈希 (清理输出中可能的多余空白)
 PASSWORD_HASH=$(caddy hash-password --plaintext "$CADDY_PASS" 2>/dev/null | tr -d '[:space:]')
 if [ -z "$PASSWORD_HASH" ]; then
     echo "错误: caddy hash-password 生成失败，请检查 Caddy 是否正确安装"
@@ -412,37 +432,90 @@ fi
 # 备份旧配置
 cp -a /etc/caddy/Caddyfile "/etc/caddy/Caddyfile.bak.$(date +%F_%H%M%S)" 2>/dev/null || true
 
+# ==========================================
+# Caddyfile 使用 handle 块实现互斥路由
+# ==========================================
+# Caddy 的指令优先级规则: 同级别的 respond / reverse_proxy / basic_auth
+# 不保证按书写顺序执行。使用 handle 块可以创建互斥的路由分组:
+#   - handle @matcher1 { ... }  优先匹配
+#   - handle @matcher2 { ... }  次优先
+#   - handle { ... }            兜底 (其他所有请求)
+#
+# 路由策略:
+#   1. ?token=TOKEN 参数访问 -> 免 BasicAuth (给 CMFA 等客户端)
+#   2. 精确路径访问 -> 需要 BasicAuth (给 Clash Party / 浏览器)
+#   3. 其他所有请求 -> 404
+# ==========================================
 cat > /etc/caddy/Caddyfile <<EOF
 $DOMAIN {
-	@sub path /sub/$TOKEN.yaml
+	# 订阅文件的精确路径
+	@sub_path path /sub/$TOKEN.yaml
 
-	basic_auth @sub {
-		$CADDY_USER $PASSWORD_HASH
+	# token 参数免密访问 (给 CMFA 等不支持 BasicAuth 的客户端)
+	@sub_with_token {
+		path /sub/$TOKEN.yaml
+		query token=$TOKEN
 	}
 
-	reverse_proxy @sub 127.0.0.1:2080
+	# 1) token 参数优先：不需要 BasicAuth
+	handle @sub_with_token {
+		reverse_proxy 127.0.0.1:2080
+	}
 
-	respond "not found" 404
+	# 2) 精确路径匹配：需要 BasicAuth
+	handle @sub_path {
+		basic_auth {
+			$CADDY_USER $PASSWORD_HASH
+		}
+		reverse_proxy 127.0.0.1:2080
+	}
+
+	# 3) 其他路径全部 404
+	handle {
+		respond "not found" 404
+	}
 }
 EOF
 
 caddy fmt --overwrite /etc/caddy/Caddyfile
 
-# 先验证配置是否合法，再重载
+# 先验证配置是否合法，再应用
 if caddy validate --config /etc/caddy/Caddyfile 2>/dev/null; then
-    systemctl reload caddy
-    echo "=> Caddy 配置验证通过并已重载"
+    # 使用 restart 而非 reload：首次部署时 Caddy 可能还在用默认配置，
+    # reload 有时不能正确切换到新域名的 TLS 证书申请
+    systemctl restart caddy
+    echo "=> Caddy 配置验证通过并已重启"
 else
     echo "错误: Caddyfile 验证失败，请手动检查 /etc/caddy/Caddyfile"
     echo "Caddy 仍在使用旧配置运行"
     exit 1
 fi
 
-# URL 编码函数 (用于输出带认证的链接)
-urlencode() {
-    python3 -c "import urllib.parse; print(urllib.parse.quote('$1', safe=''))"
-}
+# 等待 Caddy 启动就绪
+sleep 2
 
+# ===================== 部署验证 =====================
+echo ""
+echo "=> 正在验证本地服务..."
+
+# 验证 Python 后端是否响应
+if curl -sf -o /dev/null "http://127.0.0.1:2080/sub/$TOKEN.yaml"; then
+    echo "   [OK] Python 订阅服务正常响应"
+else
+    echo "   [WARN] Python 订阅服务未响应，请检查: journalctl -u sub-server -n 40"
+fi
+
+# 验证 Caddy 是否正常转发 (通过 token 参数)
+HTTP_CODE=$(curl -sf -o /dev/null -w '%{http_code}' "https://$DOMAIN/sub/$TOKEN.yaml?token=$TOKEN" 2>/dev/null || echo "000")
+if [ "$HTTP_CODE" = "200" ]; then
+    echo "   [OK] Caddy HTTPS 转发正常 (token 免密访问)"
+elif [ "$HTTP_CODE" = "000" ]; then
+    echo "   [INFO] HTTPS 验证跳过 (证书可能还在申请中，稍后自动生效)"
+else
+    echo "   [WARN] Caddy 返回 HTTP $HTTP_CODE，请检查: journalctl -u caddy -n 40"
+fi
+
+# ===================== 输出部署信息 =====================
 ENCODED_USER=$(urlencode "$CADDY_USER")
 ENCODED_PASS=$(urlencode "$CADDY_PASS")
 
@@ -451,23 +524,33 @@ echo "=================================================="
 echo "                   部署完成!                      "
 echo "=================================================="
 echo ""
-echo "请在 Clash / Stash 客户端中使用以下信息导入订阅："
+echo "--- 方式一: BasicAuth 认证访问 (Clash Party / Stash) ---"
 echo ""
 echo "  订阅地址: https://$DOMAIN/sub/$TOKEN.yaml"
 echo "  认证方式: Basic Auth"
 echo "  用户名:   $CADDY_USER"
 echo "  密码:     <你刚刚输入的密码>"
 echo ""
-echo "或者使用一键带认证链接直接导入："
+echo "  一键导入链接 (已自动 URL 编码):"
 echo "  https://${ENCODED_USER}:${ENCODED_PASS}@${DOMAIN}/sub/${TOKEN}.yaml"
+echo ""
+echo "--- 方式二: Token 免密访问 (CMFA / 不支持 BasicAuth 的客户端) ---"
+echo ""
+echo "  https://${DOMAIN}/sub/${TOKEN}.yaml?token=${TOKEN}"
 echo ""
 echo "=================================================="
 echo ""
-echo "常用排查命令："
-echo "  journalctl -u sub-server -n 80 --no-pager"
-echo "  journalctl -u caddy -n 80 --no-pager"
+echo "服务状态:"
+echo "  systemctl status sub-server caddy"
 echo "  systemctl list-timers --all | grep -E 'refresh|reset'"
 echo ""
-echo "测试命令:"
-echo "  curl -sD - -u '${CADDY_USER}:<密码>' 'https://${DOMAIN}/sub/${TOKEN}.yaml' -o /dev/null | grep -i subscription-userinfo"
+echo "常用排查命令:"
+echo "  journalctl -u sub-server -n 80 --no-pager"
+echo "  journalctl -u caddy -n 80 --no-pager"
+echo ""
+echo "测试命令 (BasicAuth):"
+echo "  curl -sD - -u '${CADDY_USER}:<密码>' 'https://${DOMAIN}/sub/${TOKEN}.yaml' -o /dev/null | head -20"
+echo ""
+echo "测试命令 (Token 免密):"
+echo "  curl -sD - 'https://${DOMAIN}/sub/${TOKEN}.yaml?token=${TOKEN}' -o /dev/null | head -20"
 echo ""
