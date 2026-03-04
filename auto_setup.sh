@@ -71,8 +71,8 @@ while true; do
     break
 done
 
-read -rp "请输入每月流量上限 (GiB，默认 200): " TRAFFIC_LIMIT_GIB
-TRAFFIC_LIMIT_GIB=${TRAFFIC_LIMIT_GIB:-200}
+read -rp "请输入每月流量上限 (GiB，0 或留空表示无限，默认 0): " TRAFFIC_LIMIT_GIB
+TRAFFIC_LIMIT_GIB=${TRAFFIC_LIMIT_GIB:-0}
 read -rp "请输入计费时区 (默认 America/Los_Angeles): " TZ_NAME
 TZ_NAME=${TZ_NAME:-America/Los_Angeles}
 
@@ -286,11 +286,15 @@ YAML_TOKEN_PATH = os.environ.get("SUB_TOKEN_PATH",  "/sub/token.yaml")
 JSON_TOKEN_PATH = os.environ.get("SUB_JSON_TOKEN_PATH", "/sub/token.json")
 YAML_PATH  = os.environ.get("SUB_YAML_PATH",   "/var/lib/subsrv/client.yaml")
 JSON_PATH  = os.environ.get("SUB_JSON_PATH",   "/var/lib/subsrv/client.json")
-LIMIT_GIB  = float(os.environ.get("SUB_LIMIT_GIB", "200"))
+LIMIT_GIB  = float(os.environ.get("SUB_LIMIT_GIB", "0"))
 TZ_NAME    = os.environ.get("SUB_TZ",          "America/Los_Angeles")
 STATE_PATH = os.environ.get("SUB_STATE_PATH",  "/var/lib/subsrv/tx_state.json")
 
-TOTAL_BYTES = int(LIMIT_GIB * 1024 * 1024 * 1024)
+# 0 表示无限流量，用 1 TiB 作为显示值 (客户端会显示几乎用不完的额度)
+if LIMIT_GIB <= 0:
+    TOTAL_BYTES = int(1024 * 1024 * 1024 * 1024)  # 1 TiB
+else:
+    TOTAL_BYTES = int(LIMIT_GIB * 1024 * 1024 * 1024)
 
 # 路径 -> (文件路径, Content-Type) 的映射表
 ROUTE_MAP = {
