@@ -4,11 +4,12 @@ set -euo pipefail
 # ==============================================================================
 # VPS 流量统计与订阅管理 自动配置脚本
 # 用法:
-#   bash <(curl -fsSL https://raw.githubusercontent.com/xiaolingxiaoying/vps_proxy_auto_setup/main/auto_setup.sh)
+#   bash <(curl -fsSL https://raw.githubusercontent.com/xiaolingxiaoying/vps-sub-meter/main/auto_setup.sh)
 #
 # 功能:
 #   - 通过 vnstat + sysfs 实时监控 VPS 出口流量
-#   - Python HTTP 服务下发带 subscription-userinfo 的订阅 YAML
+#   - Python HTTP 服务下发带 subscription-userinfo 的订阅 (YAML + JSON)
+#   - 同时支持 Clash Meta (YAML) 和 sing-box (JSON) 订阅格式
 #   - Caddy 反向代理提供 HTTPS + Basic Auth 鉴权
 #   - 支持 ?token= 参数免密访问 (给 CMFA 等不支持 BasicAuth 的客户端)
 #   - 每月自动重置流量基线
@@ -143,7 +144,7 @@ mkdir -p /var/lib/subsrv
 chown subsrv:subsrv /var/lib/subsrv
 chmod 750 /var/lib/subsrv
 
-# 初始化订阅配置副本
+# 初始化订阅配置副本 — Clash Meta (YAML)
 if [ -f /etc/s-box/clash_meta_client.yaml ]; then
     cp -f /etc/s-box/clash_meta_client.yaml /var/lib/subsrv/client.yaml
 else
@@ -152,6 +153,16 @@ else
 fi
 chown subsrv:subsrv /var/lib/subsrv/client.yaml
 chmod 640 /var/lib/subsrv/client.yaml
+
+# 初始化订阅配置副本 — sing-box (JSON)
+if [ -f /etc/s-box/sing_box_client.json ]; then
+    cp -f /etc/s-box/sing_box_client.json /var/lib/subsrv/client.json
+else
+    echo '{"log":{"level":"warn"},"dns":{},"inbounds":[],"outbounds":[]}' > /var/lib/subsrv/client.json
+    echo "=> 警告: /etc/s-box/sing_box_client.json 不存在，已创建默认空配置"
+fi
+chown subsrv:subsrv /var/lib/subsrv/client.json
+chmod 640 /var/lib/subsrv/client.json
 
 # 初始化流量状态文件
 touch /var/lib/subsrv/tx_state.json
@@ -162,14 +173,28 @@ echo "[5/8] 配置配置文件定时同步 (每 5 分钟)..."
 cat > /usr/local/bin/refresh_sub_copy.sh <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
-SRC="/etc/s-box/clash_meta_client.yaml"
-DST="/var/lib/subsrv/client.yaml"
-TMP="/var/lib/subsrv/client.yaml.tmp"
-[ -f "$SRC" ] || exit 0
-cp -f "$SRC" "$TMP"
-chown subsrv:subsrv "$TMP"
-chmod 640 "$TMP"
-mv -f "$TMP" "$DST"
+
+# 同步 Clash Meta 配置 (YAML)
+SRC_YAML="/etc/s-box/clash_meta_client.yaml"
+DST_YAML="/var/lib/subsrv/client.yaml"
+if [ -f "$SRC_YAML" ]; then
+    TMP_YAML="/var/lib/subsrv/client.yaml.tmp"
+    cp -f "$SRC_YAML" "$TMP_YAML"
+    chown subsrv:subsrv "$TMP_YAML"
+    chmod 640 "$TMP_YAML"
+    mv -f "$TMP_YAML" "$DST_YAML"
+fi
+
+# 同步 sing-box 配置 (JSON)
+SRC_JSON="/etc/s-box/sing_box_client.json"
+DST_JSON="/var/lib/subsrv/client.json"
+if [ -f "$SRC_JSON" ]; then
+    TMP_JSON="/var/lib/subsrv/client.json.tmp"
+    cp -f "$SRC_JSON" "$TMP_JSON"
+    chown subsrv:subsrv "$TMP_JSON"
+    chmod 640 "$TMP_JSON"
+    mv -f "$TMP_JSON" "$DST_JSON"
+fi
 SH
 chmod +x /usr/local/bin/refresh_sub_copy.sh
 
@@ -257,13 +282,21 @@ def log(msg):
     print(f"[sub_server] {ts} {msg}", flush=True)
 
 IFACE      = os.environ.get("SUB_IFACE",      "ens4")
-TOKEN_PATH = os.environ.get("SUB_TOKEN_PATH",  "/sub/token.yaml")
+YAML_TOKEN_PATH = os.environ.get("SUB_TOKEN_PATH",  "/sub/token.yaml")
+JSON_TOKEN_PATH = os.environ.get("SUB_JSON_TOKEN_PATH", "/sub/token.json")
 YAML_PATH  = os.environ.get("SUB_YAML_PATH",   "/var/lib/subsrv/client.yaml")
+JSON_PATH  = os.environ.get("SUB_JSON_PATH",   "/var/lib/subsrv/client.json")
 LIMIT_GIB  = float(os.environ.get("SUB_LIMIT_GIB", "200"))
 TZ_NAME    = os.environ.get("SUB_TZ",          "America/Los_Angeles")
 STATE_PATH = os.environ.get("SUB_STATE_PATH",  "/var/lib/subsrv/tx_state.json")
 
 TOTAL_BYTES = int(LIMIT_GIB * 1024 * 1024 * 1024)
+
+# 路径 -> (文件路径, Content-Type) 的映射表
+ROUTE_MAP = {
+    YAML_TOKEN_PATH: (YAML_PATH, "text/yaml; charset=utf-8"),
+    JSON_TOKEN_PATH: (JSON_PATH, "application/json; charset=utf-8"),
+}
 
 def pt_now():
     if ZoneInfo:
@@ -339,10 +372,14 @@ class Handler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         log(f"{'HEAD' if self._head_only else 'GET'} {path} from {self.client_address[0]}")
 
-        if path != TOKEN_PATH:
+        # 查找路由
+        route = ROUTE_MAP.get(path)
+        if route is None:
             self.send_response(404)
             self.end_headers()
             return
+
+        file_path, content_type = route
 
         try:
             used_tx, base_tx, cur_tx = month_used_tx_bytes_realtime()
@@ -354,18 +391,21 @@ class Handler(BaseHTTPRequestHandler):
         remain = max(TOTAL_BYTES - used_tx, 0)
 
         try:
-            with open(YAML_PATH, "rb") as f:
+            with open(file_path, "rb") as f:
                 body = f.read()
-            log(f"read yaml ok: {YAML_PATH} bytes={len(body)}")
+            log(f"read ok: {file_path} bytes={len(body)}")
         except Exception as e:
-            log(f"ERROR read yaml: {e}")
-            body = b"# subscription source missing\n"
+            log(f"ERROR read file: {e}")
+            if content_type.startswith("application/json"):
+                body = b'{"error":"subscription source missing"}\n'
+            else:
+                body = b"# subscription source missing\n"
 
         header_val = f"upload=0; download={used_tx}; total={TOTAL_BYTES}; expire={expire}"
         log(f"userinfo: used_tx={used_tx} remain={remain} ym={current_ym_pt()} base_tx={base_tx} cur_tx={cur_tx}")
 
         self.send_response(200)
-        self.send_header("Content-Type", "text/yaml; charset=utf-8")
+        self.send_header("Content-Type", content_type)
         self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
         self.send_header("Pragma", "no-cache")
         self.send_header("Expires", "0")
@@ -381,7 +421,10 @@ class Handler(BaseHTTPRequestHandler):
 def main():
     host = os.environ.get("SUB_LISTEN", "127.0.0.1")
     port = int(os.environ.get("SUB_PORT", "2080"))
-    log(f"start listen={host}:{port} iface={IFACE} tz={TZ_NAME} token_path={TOKEN_PATH} state={STATE_PATH}")
+    log(f"start listen={host}:{port} iface={IFACE} tz={TZ_NAME}")
+    log(f"  yaml: {YAML_TOKEN_PATH} -> {YAML_PATH}")
+    log(f"  json: {JSON_TOKEN_PATH} -> {JSON_PATH}")
+    log(f"  state={STATE_PATH}")
     HTTPServer((host, port), Handler).serve_forever()
 
 if __name__ == "__main__":
@@ -400,7 +443,9 @@ User=subsrv
 Group=subsrv
 Environment=SUB_IFACE=$IFACE
 Environment=SUB_TOKEN_PATH=/sub/$TOKEN.yaml
+Environment=SUB_JSON_TOKEN_PATH=/sub/$TOKEN.json
 Environment=SUB_YAML_PATH=/var/lib/subsrv/client.yaml
+Environment=SUB_JSON_PATH=/var/lib/subsrv/client.json
 Environment=SUB_LIMIT_GIB=$TRAFFIC_LIMIT_GIB
 Environment=SUB_TZ=$TZ_NAME
 Environment=SUB_STATE_PATH=/var/lib/subsrv/tx_state.json
@@ -448,12 +493,14 @@ cp -a /etc/caddy/Caddyfile "/etc/caddy/Caddyfile.bak.$(date +%F_%H%M%S)" 2>/dev/
 # ==========================================
 cat > /etc/caddy/Caddyfile <<EOF
 $DOMAIN {
-	# 订阅文件的精确路径
-	@sub_path path /sub/$TOKEN.yaml
+	# 订阅文件的精确路径 (Clash Meta YAML + sing-box JSON)
+	@sub_path {
+		path /sub/$TOKEN.yaml /sub/$TOKEN.json
+	}
 
-	# token 参数免密访问 (给 CMFA 等不支持 BasicAuth 的客户端)
+	# token 参数免密访问 (给 CMFA / SFA 等不支持 BasicAuth 的客户端)
 	@sub_with_token {
-		path /sub/$TOKEN.yaml
+		path /sub/$TOKEN.yaml /sub/$TOKEN.json
 		query token=$TOKEN
 	}
 
@@ -500,9 +547,15 @@ echo "=> 正在验证本地服务..."
 
 # 验证 Python 后端是否响应
 if curl -sf -o /dev/null "http://127.0.0.1:2080/sub/$TOKEN.yaml"; then
-    echo "   [OK] Python 订阅服务正常响应"
+    echo "   [OK] Python 订阅服务正常响应 (Clash Meta YAML)"
 else
-    echo "   [WARN] Python 订阅服务未响应，请检查: journalctl -u sub-server -n 40"
+    echo "   [WARN] Python 订阅服务未响应 (YAML)，请检查: journalctl -u sub-server -n 40"
+fi
+
+if curl -sf -o /dev/null "http://127.0.0.1:2080/sub/$TOKEN.json"; then
+    echo "   [OK] Python 订阅服务正常响应 (sing-box JSON)"
+else
+    echo "   [WARN] Python 订阅服务未响应 (JSON)，请检查: journalctl -u sub-server -n 40"
 fi
 
 # 验证 Caddy 是否正常转发 (通过 token 参数)
@@ -524,12 +577,14 @@ echo "=================================================="
 echo "                   部署完成!                      "
 echo "=================================================="
 echo ""
+echo "============= Clash Meta (YAML) 订阅 ============="
+echo ""
 echo "--- 方式一: BasicAuth 认证访问 (Clash Party / Stash) ---"
 echo ""
 echo "  订阅地址: https://$DOMAIN/sub/$TOKEN.yaml"
 echo "  认证方式: Basic Auth"
 echo "  用户名:   $CADDY_USER"
-echo "  密码:     <你刚刚输入的密码>"
+echo "  密码:     $CADDY_PASS"
 echo ""
 echo "  一键导入链接 (已自动 URL 编码):"
 echo "  https://${ENCODED_USER}:${ENCODED_PASS}@${DOMAIN}/sub/${TOKEN}.yaml"
@@ -537,6 +592,22 @@ echo ""
 echo "--- 方式二: Token 免密访问 (CMFA / 不支持 BasicAuth 的客户端) ---"
 echo ""
 echo "  https://${DOMAIN}/sub/${TOKEN}.yaml?token=${TOKEN}"
+echo ""
+echo "============= sing-box (JSON) 订阅 ============="
+echo ""
+echo "--- 方式一: BasicAuth 认证访问 ---"
+echo ""
+echo "  订阅地址: https://$DOMAIN/sub/$TOKEN.json"
+echo "  认证方式: Basic Auth"
+echo "  用户名:   $CADDY_USER"
+echo "  密码:     $CADDY_PASS"
+echo ""
+echo "  一键导入链接 (已自动 URL 编码):"
+echo "  https://${ENCODED_USER}:${ENCODED_PASS}@${DOMAIN}/sub/${TOKEN}.json"
+echo ""
+echo "--- 方式二: Token 免密访问 (SFA / SFI / SFM 等 sing-box 客户端) ---"
+echo ""
+echo "  https://${DOMAIN}/sub/${TOKEN}.json?token=${TOKEN}"
 echo ""
 echo "=================================================="
 echo ""
@@ -548,9 +619,15 @@ echo "常用排查命令:"
 echo "  journalctl -u sub-server -n 80 --no-pager"
 echo "  journalctl -u caddy -n 80 --no-pager"
 echo ""
-echo "测试命令 (BasicAuth):"
-echo "  curl -sD - -u '${CADDY_USER}:<密码>' 'https://${DOMAIN}/sub/${TOKEN}.yaml' -o /dev/null | head -20"
+echo "测试命令 (Clash Meta YAML - BasicAuth):"
+echo "  curl -sD - -u '${CADDY_USER}:${CADDY_PASS}' 'https://${DOMAIN}/sub/${TOKEN}.yaml' -o /dev/null | head -20"
 echo ""
-echo "测试命令 (Token 免密):"
+echo "测试命令 (Clash Meta YAML - Token 免密):"
 echo "  curl -sD - 'https://${DOMAIN}/sub/${TOKEN}.yaml?token=${TOKEN}' -o /dev/null | head -20"
+echo ""
+echo "测试命令 (sing-box JSON - BasicAuth):"
+echo "  curl -sD - -u '${CADDY_USER}:${CADDY_PASS}' 'https://${DOMAIN}/sub/${TOKEN}.json' -o /dev/null | head -20"
+echo ""
+echo "测试命令 (sing-box JSON - Token 免密):"
+echo "  curl -sD - 'https://${DOMAIN}/sub/${TOKEN}.json?token=${TOKEN}' -o /dev/null | head -20"
 echo ""
