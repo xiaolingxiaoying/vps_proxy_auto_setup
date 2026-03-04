@@ -4,7 +4,7 @@ set -euo pipefail
 # ==============================================================================
 # VPS 流量统计与订阅管理 自动配置脚本
 # 用法:
-#   bash <(curl -fsSL https://raw.githubusercontent.com/<user>/<repo>/main/auto_setup.sh)
+#   bash <(curl -fsSL https://raw.githubusercontent.com/xiaolingxiaoying/vps_proxy_auto_setup/main/auto_setup.sh)
 #
 # 功能:
 #   - 通过 vnstat + sysfs 实时监控 VPS 出口流量
