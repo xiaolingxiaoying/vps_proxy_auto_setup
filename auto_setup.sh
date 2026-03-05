@@ -96,20 +96,49 @@ save_config() {
     mkdir -p "$config_dir"
     chmod 700 "$config_dir"
 
-    cat > "$CONFIG_FILE" <<EOF
-# VPS 订阅服务配置文件
-# 生成时间: $(date -Iseconds)
+    # 使用 python3 写入配置文件，彻底避免 shell 对 $ 的展开
+    # (bcrypt 哈希含 $2a$14$ 等，直接用 heredoc 或 echo 会被 shell 破坏)
+    python3 - \
+        "$CONFIG_FILE" \
+        "${DOMAIN}" \
+        "${CADDY_USER}" \
+        "${PASSWORD_HASH:-}" \
+        "${TRAFFIC_LIMIT_GIB}" \
+        "${TZ_NAME}" \
+        "${IFACE}" \
+        "${TOKEN}" \
+        "${BACKEND_PORT:-2080}" \
+        <<'PYEOF'
+import sys, os
+from datetime import datetime
 
-DOMAIN="${DOMAIN}"
-CADDY_USER="${CADDY_USER}"
-CADDY_PASS_HASH="${PASSWORD_HASH:-}"
-TRAFFIC_LIMIT_GIB="${TRAFFIC_LIMIT_GIB}"
-TZ_NAME="${TZ_NAME}"
-IFACE="${IFACE}"
-TOKEN="${TOKEN}"
-BACKEND_PORT="${BACKEND_PORT:-2080}"
-EOF
-    chmod 600 "$CONFIG_FILE"
+cfg_file   = sys.argv[1]
+domain     = sys.argv[2]
+caddy_user = sys.argv[3]
+pass_hash  = sys.argv[4]
+limit_gib  = sys.argv[5]
+tz_name    = sys.argv[6]
+iface      = sys.argv[7]
+token      = sys.argv[8]
+backend_port = sys.argv[9]
+
+lines = [
+    "# VPS 订阅服务配置文件",
+    f"# 生成时间: {datetime.now().astimezone().isoformat()}",
+    "",
+    f"DOMAIN={domain!r}",
+    f"CADDY_USER={caddy_user!r}",
+    f"CADDY_PASS_HASH={pass_hash!r}",
+    f"TRAFFIC_LIMIT_GIB={limit_gib!r}",
+    f"TZ_NAME={tz_name!r}",
+    f"IFACE={iface!r}",
+    f"TOKEN={token!r}",
+    f"BACKEND_PORT={backend_port!r}",
+]
+with open(cfg_file, "w", encoding="utf-8") as f:
+    f.write("\n".join(lines) + "\n")
+os.chmod(cfg_file, 0o600)
+PYEOF
     echo "=> 配置已保存到 $CONFIG_FILE"
 }
 
@@ -120,15 +149,50 @@ load_config() {
         read -rp "是否加载已有配置? [Y/n]: " load_choice
         load_choice=${load_choice:-Y}
         if [[ "$load_choice" =~ ^[Yy] ]]; then
-            # 临时禁用 unset 变量检查以加载配置文件
-            set +u
-            # shellcheck source=/dev/null
-            if ! source "$CONFIG_FILE" 2>/dev/null; then
+            # 使用 python3 解析配置文件，避免 source 时 shell 展开 bcrypt 哈希中的 $
+            local parse_result
+            parse_result=$(python3 - "$CONFIG_FILE" <<'PYEOF'
+import sys, shlex
+
+cfg = sys.argv[1]
+out = []
+try:
+    with open(cfg, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "=" not in line:
+                continue
+            key, _, val = line.partition("=")
+            key = key.strip()
+            # shlex.split 处理单引号/双引号包裹的值
+            try:
+                val = shlex.split(val.strip())[0]
+            except Exception:
+                val = val.strip().strip("'\"")
+            out.append(f"{key}={shlex.quote(val)}")
+except Exception as e:
+    print(f"ERROR: {e}", file=sys.stderr)
+    sys.exit(1)
+
+print("\n".join(out))
+PYEOF
+            ) || {
                 echo "警告: 配置文件损坏，将使用默认配置"
-                set -u
                 return 1
-            fi
+            }
+
+            # 将 python 输出的安全赋值语句 eval 到当前 shell
+            # 此时值已经被 shlex.quote 处理，不含裸 $ 展开风险
+            set +u
+            eval "$parse_result"
             set -u
+
+            # 将配置文件中的字段映射到脚本使用的变量名
+            CADDY_PASS_HASH="${CADDY_PASS_HASH:-}"
+            PASSWORD_HASH="${CADDY_PASS_HASH:-}"
+
             echo "=> 已加载配置: 域名=${DOMAIN:-未设置}, 用户=${CADDY_USER:-未设置}, 网卡=${IFACE:-未设置}"
             return 0
         fi
@@ -210,15 +274,23 @@ urlencode() {
 NEED_NEW_PASSWORD=true
 SAVED_PASSWORD_MODE=false
 if [ -n "${CADDY_PASS_HASH:-}" ]; then
-    echo "检测到已保存的密码 (哈希值: ${CADDY_PASS_HASH:0:20}...)"
-    read -rp "是否使用已保存的密码? [Y/n]: " use_saved
-    use_saved=${use_saved:-Y}
-    if [[ "$use_saved" =~ ^[Yy] ]]; then
-        NEED_NEW_PASSWORD=false
-        PASSWORD_HASH="$CADDY_PASS_HASH"
-        CADDY_PASS="<已保存的密码>"
-        SAVED_PASSWORD_MODE=true
-        echo "=> 将使用已保存的密码"
+    # 检查哈希是否是合法的 bcrypt 格式 ($2a$ / $2b$ / $2y$ 开头)
+    # 旧版脚本保存时 $ 会被 shell 破坏，需要检测并提示重新设置
+    if [[ "${CADDY_PASS_HASH}" =~ ^\$2[aby]\$ ]]; then
+        echo "检测到已保存的密码 (哈希值: ${CADDY_PASS_HASH:0:20}...)"
+        read -rp "是否使用已保存的密码? [Y/n]: " use_saved
+        use_saved=${use_saved:-Y}
+        if [[ "$use_saved" =~ ^[Yy] ]]; then
+            NEED_NEW_PASSWORD=false
+            PASSWORD_HASH="$CADDY_PASS_HASH"
+            CADDY_PASS="<已保存的密码>"
+            SAVED_PASSWORD_MODE=true
+            echo "=> 将使用已保存的密码"
+        fi
+    else
+        echo "警告: 已保存的密码哈希格式无效 (可能由旧版脚本的 bug 导致损坏)"
+        echo "      请重新输入密码以修复此问题"
+        CADDY_PASS_HASH=""
     fi
 fi
 
@@ -391,7 +463,11 @@ echo ""
 
 echo "[1/8] 安装基础依赖 (vnstat, python3, curl, openssl)..."
 apt-get update -qq
-apt-get install -y -qq vnstat python3 curl jq openssl debian-keyring debian-archive-keyring apt-transport-https gpg
+apt-get install -y -qq vnstat python3 python3-pip curl jq openssl debian-keyring debian-archive-keyring apt-transport-https gpg
+# 安装终端二维码库 (用于部署完成后展示订阅链接二维码)
+python3 -m pip install -q --break-system-packages "qrcode[tty]" 2>/dev/null \
+    || python3 -m pip install -q "qrcode[tty]" 2>/dev/null \
+    || true
 
 echo "[2/8] 安装 Caddy (通过官方 APT 仓库)..."
 # 使用 Caddy 官方 APT 仓库，确保稳定可靠
@@ -898,6 +974,22 @@ else
     SHOW_ONE_CLICK=true
 fi
 
+# 终端二维码辅助函数 (依赖 python3 qrcode[tty]，失败时静默跳过)
+print_qr() {
+    local url="$1"
+    python3 -c "
+import sys
+try:
+    import qrcode
+    qr = qrcode.QRCode(border=1)
+    qr.add_data(sys.argv[1])
+    qr.make(fit=True)
+    qr.print_ascii(invert=True)
+except Exception:
+    pass
+" "$url" 2>/dev/null || true
+}
+
 echo ""
 echo "=================================================="
 echo "                   部署完成!                      "
@@ -919,6 +1011,9 @@ if [ "$SHOW_ONE_CLICK" = true ]; then
         echo "  一键导入链接 (请手动替换 <密码>):"
     fi
     echo "  https://${ENCODED_USER}:${ENCODED_PASS}@${DOMAIN}/sub/${TOKEN}.yaml"
+    echo ""
+    echo "  扫码导入 (BasicAuth):"
+    print_qr "https://${ENCODED_USER}:${ENCODED_PASS}@${DOMAIN}/sub/${TOKEN}.yaml"
 else
     echo "  一键导入链接:"
     echo "  https://<用户名>:<密码>@${DOMAIN}/sub/${TOKEN}.yaml"
@@ -928,6 +1023,9 @@ echo ""
 echo "--- 方式二: Token 免密访问 (CMFA / 不支持 BasicAuth 的客户端) ---"
 echo ""
 echo "  https://${DOMAIN}/sub/${TOKEN}.yaml?token=${TOKEN}"
+echo ""
+echo "  扫码导入 (Token 免密):"
+print_qr "https://${DOMAIN}/sub/${TOKEN}.yaml?token=${TOKEN}"
 echo ""
 echo "============= sing-box (JSON) 订阅 ============="
 echo ""
@@ -945,6 +1043,9 @@ if [ "$SHOW_ONE_CLICK" = true ]; then
         echo "  一键导入链接 (请手动替换 <密码>):"
     fi
     echo "  https://${ENCODED_USER}:${ENCODED_PASS}@${DOMAIN}/sub/${TOKEN}.json"
+    echo ""
+    echo "  扫码导入 (BasicAuth):"
+    print_qr "https://${ENCODED_USER}:${ENCODED_PASS}@${DOMAIN}/sub/${TOKEN}.json"
 else
     echo "  一键导入链接:"
     echo "  https://<用户名>:<密码>@${DOMAIN}/sub/${TOKEN}.json"
@@ -954,6 +1055,9 @@ echo ""
 echo "--- 方式二: Token 免密访问 (SFA / SFI / SFM 等 sing-box 客户端) ---"
 echo ""
 echo "  https://${DOMAIN}/sub/${TOKEN}.json?token=${TOKEN}"
+echo ""
+echo "  扫码导入 (Token 免密):"
+print_qr "https://${DOMAIN}/sub/${TOKEN}.json?token=${TOKEN}"
 echo ""
 echo "=================================================="
 echo ""
