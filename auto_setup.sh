@@ -101,9 +101,9 @@ save_config() {
 # 生成时间: $(date -Iseconds)
 
 DOMAIN="${DOMAIN}"
-CADDY_USER="${CADDY_USER}"
-CADDY_PASS_HASH="${PASSWORD_HASH}"
-TRAFFIC_LIMIT_GIB="${TRAFFIC_LIMIT_GIB}"
+    CADDY_USER="${CADDY_USER}"
+    CADDY_PASS_HASH="${PASSWORD_HASH:-}"
+    TRAFFIC_LIMIT_GIB="${TRAFFIC_LIMIT_GIB}"
 TZ_NAME="${TZ_NAME}"
 IFACE="${IFACE}"
 TOKEN="${TOKEN}"
@@ -120,11 +120,15 @@ load_config() {
         read -rp "是否加载已有配置? [Y/n]: " load_choice
         load_choice=${load_choice:-Y}
         if [[ "$load_choice" =~ ^[Yy] ]]; then
+            # 临时禁用 unset 变量检查以加载配置文件
+            set +u
             # shellcheck source=/dev/null
             if ! source "$CONFIG_FILE" 2>/dev/null; then
                 echo "警告: 配置文件损坏，将使用默认配置"
+                set -u
                 return 1
             fi
+            set -u
             echo "=> 已加载配置: 域名=$DOMAIN, 用户=$CADDY_USER, 网卡=$IFACE"
             return 0
         fi
@@ -204,6 +208,7 @@ urlencode() {
 
 # 密码输入与验证
 NEED_NEW_PASSWORD=true
+SAVED_PASSWORD_MODE=false
 if [ -n "${CADDY_PASS_HASH:-}" ]; then
     echo "检测到已保存的密码 (哈希值: ${CADDY_PASS_HASH:0:20}...)"
     read -rp "是否使用已保存的密码? [Y/n]: " use_saved
@@ -211,14 +216,13 @@ if [ -n "${CADDY_PASS_HASH:-}" ]; then
     if [[ "$use_saved" =~ ^[Yy] ]]; then
         NEED_NEW_PASSWORD=false
         PASSWORD_HASH="$CADDY_PASS_HASH"
-        # 为了显示一键链接，需要设置一个标记
+        CADDY_PASS="<已保存的密码>"
         SAVED_PASSWORD_MODE=true
         echo "=> 将使用已保存的密码"
     fi
 fi
 
 if [ "$NEED_NEW_PASSWORD" = true ]; then
-    SAVED_PASSWORD_MODE=false
     while true; do
         read -rs -p "请输入访问密码 (用于 BasicAuth，支持特殊字符): " CADDY_PASS
         echo
@@ -350,7 +354,7 @@ fi
 
 # 生成随机 Token (如果未从配置文件加载)
 if [ -z "${TOKEN:-}" ]; then
-    TOKEN="$(openssl rand -hex 24)"
+    TOKEN="$(openssl rand -hex 24 2>/dev/null || tr -dc 'a-f0-9' < /dev/urandom | head -c 48)"
 fi
 echo
 echo "=> 安全访问 Token: $TOKEN"
