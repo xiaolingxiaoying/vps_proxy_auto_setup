@@ -101,9 +101,9 @@ save_config() {
 # 生成时间: $(date -Iseconds)
 
 DOMAIN="${DOMAIN}"
-    CADDY_USER="${CADDY_USER}"
-    CADDY_PASS_HASH="${PASSWORD_HASH:-}"
-    TRAFFIC_LIMIT_GIB="${TRAFFIC_LIMIT_GIB}"
+CADDY_USER="${CADDY_USER}"
+CADDY_PASS_HASH="${PASSWORD_HASH:-}"
+TRAFFIC_LIMIT_GIB="${TRAFFIC_LIMIT_GIB}"
 TZ_NAME="${TZ_NAME}"
 IFACE="${IFACE}"
 TOKEN="${TOKEN}"
@@ -129,7 +129,7 @@ load_config() {
                 return 1
             fi
             set -u
-            echo "=> 已加载配置: 域名=$DOMAIN, 用户=$CADDY_USER, 网卡=$IFACE"
+            echo "=> 已加载配置: 域名=${DOMAIN:-未设置}, 用户=${CADDY_USER:-未设置}, 网卡=${IFACE:-未设置}"
             return 0
         fi
     fi
@@ -342,13 +342,19 @@ while true; do
     break
 done
 
-# 检查端口是否被占用
+# 检查端口是否被占用 (排除自身 sub-server 服务)
 if ! check_port_available "$BACKEND_PORT"; then
-    echo "警告: 端口 $BACKEND_PORT 已被占用"
-    read -rp "是否继续使用此端口? [y/N]: " continue_port
-    if [[ ! "$continue_port" =~ ^[Yy] ]]; then
-        echo "已取消安装"
-        exit 1
+    # 检查是否是 sub-server 自身在占用
+    PORT_OWNER=$(ss -tlnp 2>/dev/null | grep -E "[:.]${BACKEND_PORT}[[:space:]]" | grep -oP 'users:\(\("\K[^"]+' || true)
+    if [ "$PORT_OWNER" = "sub_server.py" ] || [ "$PORT_OWNER" = "python3" ]; then
+        echo "=> 端口 $BACKEND_PORT 被 sub-server 服务占用 (重新部署将自动重启)"
+    else
+        echo "警告: 端口 $BACKEND_PORT 已被其他进程占用 (${PORT_OWNER:-未知})"
+        read -rp "是否继续使用此端口? [y/N]: " continue_port
+        if [[ ! "$continue_port" =~ ^[Yy] ]]; then
+            echo "已取消安装"
+            exit 1
+        fi
     fi
 fi
 
@@ -826,7 +832,7 @@ EOF
 caddy fmt --overwrite /etc/caddy/Caddyfile
 
 # 先验证配置是否合法，再应用
-if caddy validate --config /etc/caddy/Caddyfile 2>/dev/null; then
+if caddy validate --config /etc/caddy/Caddyfile; then
     # 使用 restart 而非 reload：首次部署时 Caddy 可能还在用默认配置，
     # reload 有时不能正确切换到新域名的 TLS 证书申请
     systemctl restart caddy
@@ -875,8 +881,8 @@ if [ "$NEED_NEW_PASSWORD" = true ]; then
     SHOW_PASSWORD="$CADDY_PASS"
     SHOW_ONE_CLICK=true
 else
-    ENCODED_USER=$(urlencode "$CADDY_USER")
-    ENCODED_PASS="<已保存的密码>"
+    ENCODED_USER=""
+    ENCODED_PASS=""
     SHOW_PASSWORD="<已保存的密码，如需查看请重新配置>"
     SHOW_ONE_CLICK=false
 fi
