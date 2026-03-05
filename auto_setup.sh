@@ -950,14 +950,45 @@ else
     echo "   [WARN] Python 订阅服务未响应 (JSON)，请检查: journalctl -u sub-server -n 40"
 fi
 
-# 验证 Caddy 是否正常转发 (通过 token 参数)
-HTTP_CODE=$(curl -sf -o /dev/null -w '%{http_code}' "https://$DOMAIN/sub/$TOKEN.yaml?token=$TOKEN" 2>/dev/null || echo "000")
-if [ "$HTTP_CODE" = "200" ]; then
-    echo "   [OK] Caddy HTTPS 转发正常 (token 免密访问)"
-elif [ "$HTTP_CODE" = "000" ]; then
-    echo "   [INFO] HTTPS 验证跳过 (证书可能还在申请中，稍后自动生效)"
+# 验证 Caddy 是否正常转发，并等待证书申请完成
+echo "=> 正在等待 Caddy 申请 SSL 证书并验证 HTTPS 访问..."
+echo "   (这可能需要 5-15 秒，请耐心等待。如果云服务商安全组未放行 80 和 443 端口，将会超时)"
+
+max_attempts=15
+caddy_success=false
+for ((i=1; i<=max_attempts; i++)); do
+    # 设置 3 秒超时，静默模式
+    HTTP_CODE=$(curl -m 3 -s -o /dev/null -w "%{http_code}" "https://$DOMAIN/sub/$TOKEN.yaml?token=$TOKEN" || echo "000")
+    if [ "$HTTP_CODE" = "200" ]; then
+        caddy_success=true
+        break
+    fi
+    sleep 2
+done
+
+if [ "$caddy_success" = true ]; then
+    echo "   [OK] Caddy HTTPS 转发正常 (SSL 证书申请成功)"
 else
-    echo "   [WARN] Caddy 返回 HTTP $HTTP_CODE，请检查: journalctl -u caddy -n 40"
+    echo ""
+    echo -e "\033[31m#########################################################################\033[0m"
+    echo -e "\033[31m                        [ 警告: HTTPS 证书申请失败 ]                     \033[0m"
+    echo -e "\033[31m#########################################################################\033[0m"
+    echo "Caddy 无法为 $DOMAIN 申请到 HTTPS 证书。通常有以下原因："
+    echo ""
+    echo "  1. ⚠️ 防火墙拦截 (最常见): 您的云服务器 (AWS/阿里云/腾讯云等) 安全组未放行 80 和 443 端口。"
+    echo "  2. ⚠️ DNS 未生效: 您的域名还没有正确解析到本机 IP。"
+    echo "  3. ⚠️ 内部防火墙: ufw 或 iptables 阻挡了 80 和 443 端口。"
+    echo ""
+    echo "解决办法："
+    echo "  - 请前往云服务商控制台，在【安全组/防火墙】中添加入站规则，允许 TCP 80 和 443 端口。"
+    echo "  - 若在系统内使用了 ufw，请执行: ufw allow 80/tcp && ufw allow 443/tcp"
+    echo "  - 放行端口后，执行以下命令重启 Caddy，即可自动获取证书并恢复正常: "
+    echo ""
+    echo -e "\033[32m      systemctl restart caddy\033[0m"
+    echo ""
+    echo -e "\033[31m#########################################################################\033[0m"
+    echo ""
+    read -rp ">> 按回车键继续查看订阅链接 (请在修复网络后使用)... "
 fi
 
 # ===================== 输出部署信息 =====================
