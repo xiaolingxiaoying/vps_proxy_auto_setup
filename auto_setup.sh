@@ -1008,6 +1008,9 @@ fi
 # 终端二维码辅助函数 (依赖 python3 qrcode[tty]，失败时静默跳过)
 print_qr() {
     local url="$1"
+    local encoded_url
+    encoded_url=$(urlencode "$url")
+    echo "  网页二维码链接: https://api.qrserver.com/v1/create-qr-code/?size=400x400&data=${encoded_url}"
     python3 -c "
 import sys
 try:
