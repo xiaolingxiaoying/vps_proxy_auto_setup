@@ -796,6 +796,9 @@ cp -a /etc/caddy/Caddyfile "/etc/caddy/Caddyfile.bak.$(date +%F_%H%M%S)" 2>/dev/
 #   2. 精确路径访问 -> 需要 BasicAuth (给 Clash Party / 浏览器)
 #   3. 其他所有请求 -> 404
 # ==========================================
+# 注意：PASSWORD_HASH 是 bcrypt 格式，含有 $ 字符，不能直接放入 <<EOF heredoc
+# (shell 会把 $2a、$14 等当作变量展开导致哈希损坏)
+# 解决方案：先用占位符写模板，再用 printf %s 原样替换密码哈希
 cat > /etc/caddy/Caddyfile <<EOF
 $DOMAIN {
 	# 订阅文件的精确路径 (Clash Meta YAML + sing-box JSON)
@@ -817,7 +820,7 @@ $DOMAIN {
 	# 2) 精确路径匹配：需要 BasicAuth
 	handle @sub_path {
 		basic_auth {
-			$CADDY_USER $PASSWORD_HASH
+			$CADDY_USER __PASSWORD_HASH_PLACEHOLDER__
 		}
 		reverse_proxy 127.0.0.1:$BACKEND_PORT
 	}
@@ -828,6 +831,14 @@ $DOMAIN {
 	}
 }
 EOF
+
+# 用 python3 原样替换占位符 (避免 sed 特殊字符转义问题)
+python3 - "$PASSWORD_HASH" <<'PYEOF'
+import sys, pathlib
+h = sys.argv[1]
+p = pathlib.Path("/etc/caddy/Caddyfile")
+p.write_text(p.read_text().replace("__PASSWORD_HASH_PLACEHOLDER__", h))
+PYEOF
 
 caddy fmt --overwrite /etc/caddy/Caddyfile
 
