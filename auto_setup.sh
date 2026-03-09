@@ -283,9 +283,20 @@ if [ -n "${CADDY_PASS_HASH:-}" ]; then
         if [[ "$use_saved" =~ ^[Yy] ]]; then
             NEED_NEW_PASSWORD=false
             PASSWORD_HASH="$CADDY_PASS_HASH"
-            CADDY_PASS="<已保存的密码>"
-            SAVED_PASSWORD_MODE=true
-            echo "=> 将使用已保存的密码"
+            echo "=> 将使用已保存的密码哈希进行 BasicAuth 认证"
+            echo ""
+            echo "提示: 如需在部署完成后生成含密码的一键导入链接和二维码，"
+            echo "      请输入您的密码明文 (仅用于生成链接，不会额外存储)。"
+            read -rs -p "请输入密码明文 (留空则跳过，链接/二维码中将显示占位符): " CADDY_PASS
+            echo
+            if [ -n "$CADDY_PASS" ]; then
+                SAVED_PASSWORD_MODE=false
+                echo "=> 已记录密码，部署完成后将生成完整的一键导入链接和二维码"
+            else
+                CADDY_PASS="<已保存的密码>"
+                SAVED_PASSWORD_MODE=true
+                echo "=> 已跳过，一键导入链接和二维码中将显示占位符 <密码>"
+            fi
         fi
     else
         echo "警告: 已保存的密码哈希格式无效 (可能由旧版脚本的 bug 导致损坏)"
@@ -1035,8 +1046,8 @@ else
 fi
 
 # ===================== 输出部署信息 =====================
-# 只有新密码才编码显示，已保存的密码不显示明文
-if [ "$NEED_NEW_PASSWORD" = true ]; then
+# 有明文密码时 (新密码 或 已保存但用户输入了明文) 编码显示，否则显示占位符
+if [ "$SAVED_PASSWORD_MODE" = false ]; then
     ENCODED_USER=$(urlencode "$CADDY_USER")
     ENCODED_PASS=$(urlencode "$CADDY_PASS")
     SHOW_PASSWORD="$CADDY_PASS"
@@ -1082,7 +1093,7 @@ echo "  用户名:   $CADDY_USER"
 echo "  密码:     $SHOW_PASSWORD"
 echo ""
 if [ "$SHOW_ONE_CLICK" = true ]; then
-    if [ "$NEED_NEW_PASSWORD" = true ]; then
+    if [ "$SAVED_PASSWORD_MODE" = false ]; then
         echo "  一键导入链接 (已自动 URL 编码):"
     else
         echo "  一键导入链接 (请手动替换 <密码>):"
@@ -1114,7 +1125,7 @@ echo "  用户名:   $CADDY_USER"
 echo "  密码:     $SHOW_PASSWORD"
 echo ""
 if [ "$SHOW_ONE_CLICK" = true ]; then
-    if [ "$NEED_NEW_PASSWORD" = true ]; then
+    if [ "$SAVED_PASSWORD_MODE" = false ]; then
         echo "  一键导入链接 (已自动 URL 编码):"
     else
         echo "  一键导入链接 (请手动替换 <密码>):"
@@ -1146,7 +1157,7 @@ echo "  用户名:   $CADDY_USER"
 echo "  密码:     $SHOW_PASSWORD"
 echo ""
 if [ "$SHOW_ONE_CLICK" = true ]; then
-    if [ "$NEED_NEW_PASSWORD" = true ]; then
+    if [ "$SAVED_PASSWORD_MODE" = false ]; then
         echo "  一键导入链接 (已自动 URL 编码):"
     else
         echo "  一键导入链接 (请手动替换 <密码>):"
@@ -1179,7 +1190,7 @@ echo "  journalctl -u sub-server -n 80 --no-pager"
 echo "  journalctl -u caddy -n 80 --no-pager"
 echo ""
 echo "测试命令 (Clash Meta YAML - BasicAuth):"
-if [ "$NEED_NEW_PASSWORD" = true ]; then
+if [ "$SAVED_PASSWORD_MODE" = false ]; then
     echo "  curl -sD - -u '${CADDY_USER}:${CADDY_PASS}' 'https://${DOMAIN}/sub/${TOKEN}.yaml' -o /dev/null | head -20"
 else
     echo "  curl -sD - -u '${CADDY_USER}:<密码>' 'https://${DOMAIN}/sub/${TOKEN}.yaml' -o /dev/null | head -20"
@@ -1189,7 +1200,7 @@ echo "测试命令 (Clash Meta YAML - Token 免密):"
 echo "  curl -sD - 'https://${DOMAIN}/sub/${TOKEN}.yaml?token=${TOKEN}' -o /dev/null | head -20"
 echo ""
 echo "测试命令 (sing-box JSON - BasicAuth):"
-if [ "$NEED_NEW_PASSWORD" = true ]; then
+if [ "$SAVED_PASSWORD_MODE" = false ]; then
     echo "  curl -sD - -u '${CADDY_USER}:${CADDY_PASS}' 'https://${DOMAIN}/sub/${TOKEN}.json' -o /dev/null | head -20"
 else
     echo "  curl -sD - -u '${CADDY_USER}:<密码>' 'https://${DOMAIN}/sub/${TOKEN}.json' -o /dev/null | head -20"
@@ -1199,7 +1210,7 @@ echo "测试命令 (sing-box JSON - Token 免密):"
 echo "  curl -sD - 'https://${DOMAIN}/sub/${TOKEN}.json?token=${TOKEN}' -o /dev/null | head -20"
 echo ""
 echo "测试命令 (Shadowrocket TXT - BasicAuth):"
-if [ "$NEED_NEW_PASSWORD" = true ]; then
+if [ "$SAVED_PASSWORD_MODE" = false ]; then
     echo "  curl -sD - -u '${CADDY_USER}:${CADDY_PASS}' 'https://${DOMAIN}/sub/${TOKEN}.txt' -o /dev/null | head -20"
 else
     echo "  curl -sD - -u '${CADDY_USER}:<密码>' 'https://${DOMAIN}/sub/${TOKEN}.txt' -o /dev/null | head -20"
