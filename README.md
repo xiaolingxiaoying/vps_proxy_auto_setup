@@ -6,3 +6,6 @@ bash <(wget -qO- https://raw.githubusercontent.com/yonggekkk/sing-box-yg/main/sb
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/xiaolingxiaoying/vps-sub-meter/main/auto_setup.sh)
 ```
+切换ipv4或ipv6出站
+```bash
+bash <(curl -fSL https://raw.githubusrcontent.com/xiaolingxiaoying/vps-sub-meter/main/swithc_sb.mode.sh)
