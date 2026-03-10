@@ -8,4 +8,4 @@ bash <(curl -fsSL https://raw.githubusercontent.com/xiaolingxiaoying/vps-sub-met
 ```
 切换ipv4或ipv6出站
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/xiaolingxiaoying/vps-sub-meter/main/switch_sb.mode.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/xiaolingxiaoying/vps-sub-meter/main/switch_sb_mode.sh)
